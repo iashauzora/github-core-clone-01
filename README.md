@@ -73,3 +73,39 @@ The trial's CPU, memory and process limits are the rules'; its wall budget is 90
 - `package.json`, `tsconfig.json`, `LICENSE` (MIT): the entry's metadata and licence.
 
 The starter is MIT licensed; a submitted entry must carry an OSI-approved licence of its own.
+
+## This entry's implementation
+
+The starter grew into a complete in-memory forge; `main.ts` is unchanged. One `Forge`
+store (`store.ts`) sits behind all four surfaces, so an object written through any of
+them is visible through the rest: a contents-API commit can be cloned, a pushed branch
+can carry a pull request, an MCP-created issue reads back over REST with the same id.
+
+- `gitcore.ts` — the git object model in pure standard library: SHA-1 objects, tree and
+  commit codecs, packfile reading (including ofs-delta and ref-delta resolution) and
+  writing, delta application, pkt-line framing.
+- `store.ts` — repositories, refs, labels, issues, pull requests and comments over that
+  object store; contents commits, three-way tree merges (squash merges, conflict
+  detection) and pull-request file diffs. All timestamps are logical (a monotonic
+  sequence mapped to ISO strings), so a replay behaves identically.
+- `rest.ts` — REST v3: repositories (with `Link`-header pagination), branches, commits,
+  contents (create/update/delete with sha discipline: 409 on a stale sha), labels,
+  issues and comments, pull requests (files, squash merge, 405 on conflict), git refs.
+- `githttp.ts` — smart HTTP: protocol v2 when asked (`ls-refs` with prefix filtering
+  and unborn HEAD, `fetch` with want/have negotiation, shallow deepen including
+  deepen-relative, acknowledgments only when there is nothing new), v0 otherwise
+  (side-band-64k fetch), and v0 receive-pack with report-status — fast-forward only,
+  a non-fast-forward ref refused as `ng <ref> non-fast-forward` while the rest of the
+  push still applies.
+- `graphql.ts` — a small GraphQL parser/executor: viewer, repository fields, issue and
+  pull-request connections with cursor pagination, `node(id:)` round-trips of opaque
+  global ids, the five mutations, batched operations, and `__type` introspection.
+- `mcp.ts` — MCP over streamable HTTP in both eras: `server/discover` (2026-07-28) and
+  the `initialize` handshake with a session id; six tools (`create_repo`, `get_repo`,
+  `create_issue`, `list_issues`, `create_pull_request`, `merge_pull_request`) acting on
+  the same store, with a byte-identical `tools/list`.
+
+Verified locally against the kit's sealed suite (`sdk/run.ts`): 120/120 conformance
+checks and all four benchmark workloads ahead of the reference times, plus an
+end-to-end pass with the real `git` binary (v2 and v0 clone, push, shallow clone and
+deepen, non-fast-forward refusal).

@@ -90,6 +90,8 @@ interface FetchArgs {
   deepen: number | null;
   deepenSince: number | null;
   deepenNot: string[];
+  deepenRelative: boolean;
+  done: boolean;
 }
 
 interface FetchPlan {
@@ -152,8 +154,12 @@ function planFetch(forge: Forge, args: FetchArgs): FetchPlan {
     if (commit !== null) fullClosure(forge, commit, excluded);
   }
 
-  // BFS from the wants, distance 1 = a want itself.
+  // BFS from the wants, distance 1 = a want itself. Each commit also carries a depth
+  // budget: `deepen` counted from the wants, except that passing through one of the
+  // client's shallow commits with deepen-relative extends the budget to that commit's
+  // distance + deepen (git fetch --deepen on an already-shallow clone).
   const distance = new Map<string, number>();
+  const budget = new Map<string, number>();
   const queue: string[] = [];
   const extraObjects = new Map<string, GitObject>(); // wanted tags themselves
   for (const want of args.wants) {
@@ -167,6 +173,7 @@ function planFetch(forge: Forge, args: FetchArgs): FetchPlan {
     }
     if (!distance.has(commit)) {
       distance.set(commit, 1);
+      budget.set(commit, args.deepen ?? Number.POSITIVE_INFINITY);
       queue.push(commit);
     }
   }
@@ -183,7 +190,11 @@ function planFetch(forge: Forge, args: FetchArgs): FetchPlan {
     if (isPlainHave) continue; // the client holds this whole line of history
     if (isShallowHave) traversedShallow.add(current);
     else included.add(current);
-    const atDepthLimit = args.deepen !== null && dist >= args.deepen;
+    let effectiveBudget = budget.get(current) ?? Number.POSITIVE_INFINITY;
+    if (isShallowHave && args.deepenRelative && args.deepen !== null) {
+      effectiveBudget = Math.max(effectiveBudget, dist + args.deepen);
+    }
+    const atDepthLimit = args.deepen !== null && dist >= effectiveBudget;
     const beforeSince = args.deepenSince !== null && info.time > 0 && info.time < args.deepenSince;
     if (atDepthLimit || beforeSince) {
       if (info.parents.length > 0 && !isShallowHave) boundary.add(current);
@@ -196,6 +207,7 @@ function planFetch(forge: Forge, args: FetchArgs): FetchPlan {
     for (const parent of info.parents) {
       if (!distance.has(parent)) {
         distance.set(parent, dist + 1);
+        budget.set(parent, effectiveBudget);
         queue.push(parent);
       }
     }
@@ -228,7 +240,11 @@ function lsRefs(forge: Forge, repo: Repo, args: string[]): GitReply {
   const prefixes = args.filter((arg) => arg.startsWith('ref-prefix ')).map((arg) => arg.slice('ref-prefix '.length));
   const parts: Buffer[] = [];
   const headTarget = forge.headTarget(repo);
-  if (prefixes.length === 0) {
+  // HEAD is a ref like any other for prefix purposes: it is listed when no prefix was given
+  // or when a prefix matches "HEAD" itself (real git asks with `ref-prefix HEAD`); a prefix
+  // of refs/heads/... never matches it.
+  const headWanted = prefixes.length === 0 || prefixes.some((prefix) => 'HEAD'.startsWith(prefix));
+  if (headWanted) {
     const headOid = repo.refs.get(headTarget);
     if (headOid !== undefined) {
       parts.push(linePkt(`${headOid} HEAD${symrefs ? ` symref-target:${headTarget}` : ''}\n`));
@@ -251,6 +267,17 @@ function lsRefs(forge: Forge, repo: Repo, args: string[]): GitReply {
 }
 
 function fetchV2(forge: Forge, args: FetchArgs): GitReply {
+  // Negotiation phase: a request without `done` (real git's first round when it has
+  // haves) is answered with an acknowledgments section only — ACK for every have the
+  // store holds, NAK when it holds none. The client then re-requests with `done`.
+  if (!args.done) {
+    const parts: Buffer[] = [linePkt('acknowledgments\n')];
+    const acked = args.haves.filter((have) => forge.peelToCommit(have) !== null);
+    if (acked.length === 0) parts.push(linePkt('NAK\n'));
+    else for (const have of acked) parts.push(linePkt(`ACK ${have}\n`));
+    parts.push(FLUSH_PKT);
+    return { status: 200, contentType: 'application/x-git-upload-pack-result', body: Buffer.concat(parts) };
+  }
   const plan = planFetch(forge, args);
   const parts: Buffer[] = [];
   if (plan.nothingNew) {
@@ -261,9 +288,9 @@ function fetchV2(forge: Forge, args: FetchArgs): GitReply {
     parts.push(FLUSH_PKT);
     return { status: 200, contentType: 'application/x-git-upload-pack-result', body: Buffer.concat(parts) };
   }
-  if (args.haves.length > 0) {
-    parts.push(linePkt('acknowledgments\n'), linePkt('NAK\n'), FLUSH_PKT);
-  }
+  // No acknowledgments section when a packfile follows: after `done`, real upload-pack
+  // goes straight to shallow-info/packfile (acks belong to the negotiation phase, and to
+  // the nothing-new answer above). Real git's fetch-pack rejects an acks section here.
   if (plan.shallow.length > 0 || plan.unshallow.length > 0) {
     parts.push(linePkt('shallow-info\n'));
     for (const oid of plan.shallow) parts.push(linePkt(`shallow ${oid}\n`));
@@ -296,7 +323,7 @@ function fetchV0(forge: Forge, args: FetchArgs): GitReply {
 }
 
 function parseFetchArgs(lines: string[]): FetchArgs {
-  const args: FetchArgs = { wants: [], haves: [], shallow: [], deepen: null, deepenSince: null, deepenNot: [] };
+  const args: FetchArgs = { wants: [], haves: [], shallow: [], deepen: null, deepenSince: null, deepenNot: [], deepenRelative: false, done: false };
   for (const line of lines) {
     if (line.startsWith('want ')) args.wants.push(line.slice(5).trim());
     else if (line.startsWith('have ')) args.haves.push(line.slice(5).trim());
@@ -304,6 +331,8 @@ function parseFetchArgs(lines: string[]): FetchArgs {
     else if (line.startsWith('deepen ')) args.deepen = Number(line.slice(7).trim()) || null;
     else if (line.startsWith('deepen-since ')) args.deepenSince = Number(line.slice(13).trim()) || null;
     else if (line.startsWith('deepen-not ')) args.deepenNot.push(line.slice(11).trim());
+    else if (line === 'deepen-relative') args.deepenRelative = true;
+    else if (line === 'done') args.done = true;
   }
   return args;
 }

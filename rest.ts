@@ -347,7 +347,7 @@ function handleContents(forge: Forge, repo: Repo, req: RestRequest, path: string
     if (message === '' || contentBase64 === '') return fail(422, 'Validation Failed: message and content are required');
     const branch = typeof body.branch === 'string' && body.branch !== '' ? body.branch : repo.defaultBranch;
     const tip = forge.branchTip(repo, branch);
-    if (tip === undefined && !(branch === repo.defaultBranch && repo.refs.size === 0)) return fail(404, 'Branch not found');
+    if (tip === undefined && branch !== repo.defaultBranch) return fail(404, 'Branch not found');
     let existing: string | null = null;
     if (tip !== undefined) {
       const info = forge.commitInfo(tip);

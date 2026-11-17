@@ -334,7 +334,7 @@ export class Forge {
   commitChanges(repo: Repo, branch: string, changes: ReadonlyMap<string, Buffer | null>, message: string): string | null {
     const ref = `refs/heads/${branch}`;
     const tip = repo.refs.get(ref);
-    if (tip === undefined && !(branch === repo.defaultBranch && repo.refs.size === 0)) return null;
+    if (tip === undefined && branch !== repo.defaultBranch) return null;
     const seq = this.tick();
     let flat = new Map<string, { oid: string; mode: string }>();
     if (tip !== undefined) {
