@@ -21,15 +21,19 @@ function nextRequestId(): string {
 }
 
 function sendJson(res: ServerResponse, requestId: string, status: number, body: unknown, headers: Readonly<Record<string, string>> = {}): void {
-  const text = body === undefined ? '' : `${JSON.stringify(body)}\n`;
+  // Encode once into a Buffer: handing Node a string makes it re-encode on the
+  // socket path (and byteLength would be a second full scan of the text).
+  const payload = body === undefined ? EMPTY_BODY : Buffer.from(`${JSON.stringify(body)}\n`, 'utf8');
   res.writeHead(status, {
     'content-type': JSON_TYPE,
-    'content-length': Buffer.byteLength(text),
+    'content-length': payload.length,
     'x-github-request-id': requestId,
     ...headers,
   });
-  res.end(text);
+  res.end(payload);
 }
+
+const EMPTY_BODY = Buffer.alloc(0);
 
 function sendRaw(res: ServerResponse, requestId: string, status: number, contentType: string, body: Buffer): void {
   res.writeHead(status, {
@@ -41,16 +45,24 @@ function sendRaw(res: ServerResponse, requestId: string, status: number, content
   res.end(body);
 }
 
-async function readBody(req: IncomingMessage): Promise<Buffer> {
-  const chunks: Buffer[] = [];
-  let total = 0;
-  for await (const chunk of req) {
-    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as Uint8Array);
-    total += buffer.length;
-    if (total > MAX_BODY_BYTES) throw new Error('request body too large');
-    chunks.push(buffer);
-  }
-  return Buffer.concat(chunks);
+function readBody(req: IncomingMessage): Promise<Buffer> {
+  // Plain data/end accumulation: the async-iterator protocol costs measurably
+  // more per request, and most bodies here arrive as a single chunk anyway.
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    let total = 0;
+    req.on('data', (chunk: Buffer) => {
+      total += chunk.length;
+      if (total > MAX_BODY_BYTES) {
+        reject(new Error('request body too large'));
+        req.destroy();
+        return;
+      }
+      chunks.push(chunk);
+    });
+    req.on('end', () => resolve(chunks.length === 1 ? chunks[0]! : Buffer.concat(chunks)));
+    req.on('error', reject);
+  });
 }
 
 function decodeSegment(segment: string): string {

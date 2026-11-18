@@ -23,7 +23,8 @@ export function sha1Hex(data: Buffer): string {
 /** The object id of a would-be object: sha1 of "<type> <len>\0" + data. */
 export function hashObject(type: ObjType, data: Buffer): string {
   const header = Buffer.from(`${type} ${data.length}\0`, 'utf8');
-  return sha1Hex(Buffer.concat([header, data]));
+  // Two updates hash the same byte stream as header++data without copying it.
+  return createHash('sha1').update(header).update(data).digest('hex');
 }
 
 export function isOid(value: string): boolean {
@@ -101,8 +102,23 @@ export function parseCommit(data: Buffer): CommitInfo {
     else if (line.startsWith('author ')) author = line.slice(7);
     else if (line.startsWith('committer ')) committer = line.slice(10);
   }
-  const timeMatch = / (\d+) [+-]\d{4}$/.exec(committer);
-  return { tree, parents, author, committer, message, time: timeMatch ? Number(timeMatch[1]) : 0 };
+  // The committer line ends "... <email> <unix-ts> <±zzzz>": read the timestamp
+  // by scanning back from the end instead of running a regex over the line.
+  let time = 0;
+  const tzStart = committer.lastIndexOf(' ');
+  if (tzStart > 0) {
+    const tsStart = committer.lastIndexOf(' ', tzStart - 1);
+    if (tsStart >= 0) {
+      const digits = committer.slice(tsStart + 1, tzStart);
+      let allDigits = digits.length > 0;
+      for (let i = 0; i < digits.length && allDigits; i += 1) {
+        const code = digits.charCodeAt(i);
+        if (code < 0x30 || code > 0x39) allDigits = false;
+      }
+      if (allDigits) time = Number(digits);
+    }
+  }
+  return { tree, parents, author, committer, message, time };
 }
 
 export function buildCommit(info: { tree: string; parents: readonly string[]; author: string; committer: string; message: string }): Buffer {
@@ -322,7 +338,9 @@ export function writePack(objects: readonly GitObject[]): Buffer {
       headBytes.push(first);
     }
     parts.push(Buffer.from(headBytes));
-    parts.push(deflateSync(object.data));
+    // Level 1: packs stay valid at any zlib level, and the forge's packs are
+    // small and served over loopback — compression effort buys nothing here.
+    parts.push(deflateSync(object.data, { level: 1 }));
   }
   const body = Buffer.concat(parts);
   const trailer = Buffer.from(sha1Hex(body), 'hex');

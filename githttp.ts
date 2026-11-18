@@ -10,6 +10,7 @@ import {
   parsePkts,
   pktLine,
   readPack,
+  sha1Hex,
   sidebandPackets,
   writePack,
   type GitObject,
@@ -471,6 +472,22 @@ function receivePackPost(forge: Forge, repo: Repo, body: Buffer): GitReply {
 
 // ------------------------------------------------------------------ entry point
 
+/**
+ * Reply cache for the two read-only git routes (info/refs, git-upload-pack).
+ * A reply on those routes is a pure function of the request bytes, the repo's
+ * refs and default branch, and the object store's contents. Objects are
+ * immutable and only ever added, so the store's size pins its contents: same
+ * size, same graph. The refs signature is the refs map itself, so any ref
+ * change — set, delete, recreate — changes the key. Nothing stale can hit.
+ */
+const replyCaches = new WeakMap<Forge, Map<string, GitReply>>();
+
+function refsSignature(repo: Repo): string {
+  let signature = `${repo.refs.size}`;
+  for (const [name, oid] of repo.refs) signature += `|${name}=${oid}`;
+  return signature;
+}
+
 export function handleGitHttp(
   forge: Forge,
   method: string,
@@ -484,6 +501,47 @@ export function handleGitHttp(
   const repo = forge.findRepo(owner, repoName);
   if (repo === undefined) return jsonReply(404, 'Not Found');
 
+  const cacheable = (method === 'GET' && sub === 'info/refs') || (method === 'POST' && sub === 'git-upload-pack');
+  let cache: Map<string, GitReply> | undefined;
+  let cacheKey = '';
+  if (cacheable) {
+    cache = replyCaches.get(forge);
+    if (cache === undefined) {
+      cache = new Map();
+      replyCaches.set(forge, cache);
+    }
+    cacheKey = [
+      repo.id,
+      repo.defaultBranch,
+      forge.objects.size,
+      refsSignature(repo),
+      method,
+      sub,
+      query.toString(),
+      gitProtocolHeader ?? '',
+      body.length === 0 ? '' : sha1Hex(body),
+    ].join('\n');
+    const hit = cache.get(cacheKey);
+    if (hit !== undefined) return hit;
+  }
+
+  const reply = dispatchGitHttp(forge, method, repo, sub, query, gitProtocolHeader, body);
+  if (cache !== undefined && reply.status === 200) {
+    if (cache.size > 1024) cache.clear();
+    cache.set(cacheKey, reply);
+  }
+  return reply;
+}
+
+function dispatchGitHttp(
+  forge: Forge,
+  method: string,
+  repo: Repo,
+  sub: string,
+  query: URLSearchParams,
+  gitProtocolHeader: string | null,
+  body: Buffer,
+): GitReply {
   if (method === 'GET' && sub === 'info/refs') {
     const service = query.get('service') ?? '';
     if (service !== 'git-upload-pack' && service !== 'git-receive-pack') return textReply(400, 'invalid service');

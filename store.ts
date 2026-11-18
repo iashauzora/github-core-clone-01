@@ -86,6 +86,9 @@ export interface Repo {
 export class Forge {
   readonly objects = new Map<string, GitObject>();
   readonly repos = new Map<string, Repo>();
+  /** Parsed commits by oid. Objects are immutable and content-addressed, so a parse never
+   * goes stale; only successful parses are cached (a missing oid may arrive later). */
+  private readonly commitInfoCache = new Map<string, ReturnType<typeof parseCommit>>();
   seq = 0;
   private nextRepoId = 5001;
   private nextGid = 1;
@@ -96,8 +99,15 @@ export class Forge {
     return this.seq;
   }
 
+  private readonly isoCache = new Map<number, string>();
+
   isoOf(seq: number): string {
-    return new Date((EPOCH_BASE_SEC + seq) * 1000).toISOString();
+    const cached = this.isoCache.get(seq);
+    if (cached !== undefined) return cached;
+    const iso = new Date((EPOCH_BASE_SEC + seq) * 1000).toISOString();
+    if (this.isoCache.size > 100_000) this.isoCache.clear();
+    this.isoCache.set(seq, iso);
+    return iso;
   }
 
   // -------------------------------------------------------------- objects
@@ -129,9 +139,13 @@ export class Forge {
   }
 
   commitInfo(oid: string): ReturnType<typeof parseCommit> | null {
+    const cached = this.commitInfoCache.get(oid);
+    if (cached !== undefined) return cached;
     const object = this.objects.get(oid);
     if (object === undefined || object.type !== 'commit') return null;
-    return parseCommit(object.data);
+    const info = parseCommit(object.data);
+    this.commitInfoCache.set(oid, info);
+    return info;
   }
 
   treeEntries(treeOid: string): TreeEntry[] {
@@ -230,7 +244,22 @@ export class Forge {
 
   isAncestor(ancestor: string, descendant: string): boolean {
     if (ancestor === descendant) return true;
-    return this.ancestorsOf(descendant).has(ancestor);
+    // Early-exit twin of ancestorsOf: identical stack order, limit and
+    // skip-missing rule, but it stops the moment the ancestor is reached
+    // instead of building the whole reachable set (the receive-pack
+    // fast-forward check usually finds the old tip one step down).
+    const seen = new Set<string>();
+    const stack = [descendant];
+    while (stack.length > 0 && seen.size < 100_000) {
+      const current = stack.pop()!;
+      if (seen.has(current)) continue;
+      const info = this.commitInfo(current);
+      if (info === null) continue;
+      if (current === ancestor) return true;
+      seen.add(current);
+      for (const parent of info.parents) stack.push(parent);
+    }
+    return false;
   }
 
   /** A best common ancestor of two commits (BFS from b over a's ancestor set), or null. */
